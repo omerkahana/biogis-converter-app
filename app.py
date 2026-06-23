@@ -1,11 +1,11 @@
 import json
-from pathlib import Path
+from difflib import SequenceMatcher
 
 import gspread
 import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
-from rapidfuzz import process, fuzz
+from difflib import SequenceMatcher
 
 SHEET_ID = "1b6qgqHh6g3VifXtxDCG-g3zGSpqt8mkktJEruo0qpjQ"
 
@@ -67,15 +67,27 @@ def normalize_hebrew_name(value: str) -> str:
     return text
 
 
+def similarity_score(a, b):
+    if not a or not b:
+        return 0
+    return round(SequenceMatcher(None, str(a), str(b)).ratio() * 100, 1)
+
+
 def find_best_match(name: str, choices: list[str]):
     """Return best fuzzy match for a Hebrew name."""
     if not name or not choices:
         return None, 0
-    result = process.extractOne(name, choices, scorer=fuzz.WRatio)
-    if result is None:
-        return None, 0
-    match_name, score, _ = result
-    return match_name, score
+
+    best_name = None
+    best_score = 0
+
+    for choice in choices:
+        score = similarity_score(name, choice)
+        if score > best_score:
+            best_name = choice
+            best_score = score
+
+    return best_name, best_score
 
 
 def read_occurrence_csv(uploaded_file) -> pd.DataFrame:
