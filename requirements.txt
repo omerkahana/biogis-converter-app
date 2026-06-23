@@ -1,6 +1,5 @@
-streamlit==1.40.2
-pandas==2.2.3
-gspread==6.1.4
-google-auth==2.36.0
-rapidfuzz==3.10.1
-openpyxl==3.1.5
+streamlit
+pandas
+openpyxl
+gspread
+google-auth
