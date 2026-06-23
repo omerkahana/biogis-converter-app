@@ -58,13 +58,73 @@ VERTEBRATE_REPORT_COLUMNS = [
 ]
 
 STATUS_LABELS = {
-    "mapped": "תוקן לפי מילון תיקונים",
-    "exact_index": "התאמה מדויקת באינדקס",
-    "needs_review": "דורש בדיקה ידנית",
-    "not_indexed_group": "קבוצה שאינה באינדקס",
-    "unknown_group": "קבוצה לא מזוהה",
-    "no_hebrew_name": "חסר שם עברי",
+    "mapped": "Resolved from name mapping",
+    "exact_index": "Exact index match",
+    "needs_review": "Needs manual review",
+    "not_indexed_group": "Group not indexed",
+    "unknown_group": "Unknown group",
+    "no_hebrew_name": "Missing Hebrew name",
 }
+
+GROUP_LABELS = {
+    "plants": "Plants",
+    "vertebrates": "Vertebrates",
+    "invertebrates": "Invertebrates",
+    "fungi": "Fungi",
+    "unknown": "Unknown",
+}
+
+ACTION_SAVE_INDEX = "Save selected index name"
+ACTION_ADD_NEW = "Add as new species to index"
+ACTION_MARK_UNRESOLVED = "Mark as unresolved for now"
+ACTION_SKIP = "Skip"
+
+BATCH_ACTIONS = [
+    ACTION_SAVE_INDEX,
+    ACTION_ADD_NEW,
+    ACTION_MARK_UNRESOLVED,
+    ACTION_SKIP,
+]
+
+
+# -----------------------------------------------------------------------------
+# Page style
+# -----------------------------------------------------------------------------
+
+
+def apply_page_style() -> None:
+    """Make the app feel like a clean English/LTR web app."""
+    st.markdown(
+        """
+        <style>
+        html, body, [class*="css"], .stApp {
+            direction: ltr;
+            text-align: left;
+        }
+        h1, h2, h3, h4, h5, h6, p, label, span, div {
+            text-align: left;
+        }
+        section[data-testid="stSidebar"] {
+            direction: ltr;
+            text-align: left;
+        }
+        div[data-testid="stMetric"] {
+            background: #f8fafc;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 14px 16px;
+        }
+        div[data-testid="stDataFrame"], div[data-testid="stTable"] {
+            direction: ltr;
+        }
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 3rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -87,10 +147,10 @@ def get_google_client():
         creds = Credentials.from_service_account_file(str(local_key), scopes=SCOPES)
         return gspread.authorize(creds)
 
-    st.error("לא נמצאו הרשאות Google Sheets.")
+    st.error("Google Sheets credentials were not found.")
     st.warning(
-        "כדי שהאפליקציה תעבוד, צריך להגדיר Service Account ב-Streamlit Secrets "
-        "או להוסיף קובץ service_account.json בהרצה מקומית."
+        "Define the Service Account in Streamlit Secrets, or add service_account.json "
+        "when running locally."
     )
     st.stop()
 
@@ -215,10 +275,7 @@ def read_occurrence_csv(uploaded_file) -> pd.DataFrame:
 
 
 def classify_taxon(row: pd.Series) -> str:
-    """
-    Classify each occurrence row into one of:
-    plants, vertebrates, invertebrates, fungi, unknown.
-    """
+    """Classify each occurrence row into plants, vertebrates, invertebrates, fungi, or unknown."""
     kingdom = normalize_general(row.get("kingdom", ""))
     phylum = normalize_general(row.get("phylum", ""))
     clazz = normalize_general(row.get("clazz", ""))
@@ -260,15 +317,8 @@ def classify_taxon(row: pd.Series) -> str:
 
 
 def group_label(group_code: str) -> str:
-    """Hebrew label for biological group code."""
-    labels = {
-        "plants": "צמחים",
-        "vertebrates": "חולייתנים",
-        "invertebrates": "חסרי חוליות",
-        "fungi": "פטריות",
-        "unknown": "לא ידוע",
-    }
-    return labels.get(group_code, group_code)
+    """English label for biological group code."""
+    return GROUP_LABELS.get(group_code, group_code)
 
 
 def build_index_lookup(index_df: pd.DataFrame) -> dict[str, str]:
@@ -479,12 +529,7 @@ def classification_from_index_or_occurrence(
     plant_details: dict[str, dict],
     animal_details: dict[str, dict],
 ) -> str:
-    """Return the classification/status value to add to the GIS occurrence export.
-
-    The value is taken from the Sheets indexes only:
-    - plants_index: סיווג
-    - animals_index: סטטוס שימור אזורי, with global status as fallback
-    """
+    """Return the classification/status value to add to the GIS occurrence export."""
     corrected_name = normalize_hebrew_name(row.get("species_heb_corrected", ""))
     biogroup = row.get("biogroup", "")
 
@@ -518,7 +563,7 @@ def enrich_occurrence(
     enriched_df = occurrence_df.copy()
     enriched_df["species_heb_normalized"] = enriched_df["species_heb"].apply(normalize_hebrew_name)
     enriched_df["biogroup"] = enriched_df.apply(classify_taxon, axis=1)
-    enriched_df["biogroup_he"] = enriched_df["biogroup"].apply(group_label)
+    enriched_df["group_label"] = enriched_df["biogroup"].apply(group_label)
 
     plant_lookup = build_index_lookup(plants_df)
     animal_lookup = build_index_lookup(animals_df)
@@ -541,7 +586,7 @@ def enrich_occurrence(
         [enriched_df.reset_index(drop=True), resolved_df.reset_index(drop=True)],
         axis=1,
     )
-    enriched_df["match_status_he"] = enriched_df["match_status"].map(STATUS_LABELS)
+    enriched_df["match_status_label"] = enriched_df["match_status"].map(STATUS_LABELS)
 
     plant_details = build_index_detail_lookup(plants_df)
     animal_details = build_index_detail_lookup(animals_df)
@@ -561,73 +606,69 @@ def enrich_occurrence(
 def make_review_table(enriched_df: pd.DataFrame) -> pd.DataFrame:
     """Create a unique-species table for names that require manual review."""
     review_df = enriched_df[enriched_df["match_status"] == "needs_review"].copy()
-    columns = ["קבוצה", "קוד קבוצה", "שם מ-BioGIS", "הצעה קרובה", "ציון התאמה", "אינדקס", "מספר רשומות"]
+    columns = [
+        "Group",
+        "Group code",
+        "BioGIS name",
+        "Suggested index name",
+        "Score",
+        "Index",
+        "Records",
+    ]
 
     if review_df.empty:
         return pd.DataFrame(columns=columns)
 
     result = (
         review_df.groupby(
-            ["biogroup_he", "biogroup", "species_heb_normalized", "suggested_name", "match_score", "matched_index"],
+            ["group_label", "biogroup", "species_heb_normalized", "suggested_name", "match_score", "matched_index"],
             dropna=False,
         )
         .size()
-        .reset_index(name="מספר רשומות")
+        .reset_index(name="Records")
     )
 
     result = result.rename(
         columns={
-            "biogroup_he": "קבוצה",
-            "biogroup": "קוד קבוצה",
-            "species_heb_normalized": "שם מ-BioGIS",
-            "suggested_name": "הצעה קרובה",
-            "match_score": "ציון התאמה",
-            "matched_index": "אינדקס",
+            "group_label": "Group",
+            "biogroup": "Group code",
+            "species_heb_normalized": "BioGIS name",
+            "suggested_name": "Suggested index name",
+            "match_score": "Score",
+            "matched_index": "Index",
         }
     )
 
-    return result[columns].sort_values(by=["קבוצה", "ציון התאמה"], ascending=[True, False])
+    return result[columns].sort_values(by=["Group", "Score"], ascending=[True, False])
 
 
 def make_group_summary(enriched_df: pd.DataFrame) -> pd.DataFrame:
     """Summarize records and unique species by biological group."""
     count_column = "recordId" if "recordId" in enriched_df.columns else "species_heb_normalized"
     result = (
-        enriched_df.groupby(["biogroup", "biogroup_he"], dropna=False)
+        enriched_df.groupby(["biogroup", "group_label"], dropna=False)
         .agg(
-            רשומות=(count_column, "count"),
-            מינים_ייחודיים=("species_heb_normalized", "nunique"),
+            Records=(count_column, "count"),
+            **{"Unique species": ("species_heb_normalized", "nunique")},
         )
         .reset_index()
-        .rename(
-            columns={
-                "biogroup": "קוד קבוצה",
-                "biogroup_he": "קבוצה",
-                "מינים_ייחודיים": "מינים ייחודיים",
-            }
-        )
+        .rename(columns={"biogroup": "Group code", "group_label": "Group"})
     )
-    return result[["קבוצה", "רשומות", "מינים ייחודיים", "קוד קבוצה"]]
+    return result[["Group", "Records", "Unique species", "Group code"]]
 
 
 def make_match_summary(enriched_df: pd.DataFrame) -> pd.DataFrame:
     """Summarize match statuses."""
     result = (
-        enriched_df.groupby(["match_status", "match_status_he"], dropna=False)
+        enriched_df.groupby(["match_status", "match_status_label"], dropna=False)
         .agg(
-            רשומות=("species_heb_normalized", "count"),
-            מינים_ייחודיים=("species_heb_normalized", "nunique"),
+            Records=("species_heb_normalized", "count"),
+            **{"Unique species": ("species_heb_normalized", "nunique")},
         )
         .reset_index()
-        .rename(
-            columns={
-                "match_status": "קוד סטטוס",
-                "match_status_he": "סטטוס",
-                "מינים_ייחודיים": "מינים ייחודיים",
-            }
-        )
+        .rename(columns={"match_status": "Status code", "match_status_label": "Status"})
     )
-    return result[["סטטוס", "רשומות", "מינים ייחודיים", "קוד סטטוס"]]
+    return result[["Status", "Records", "Unique species", "Status code"]]
 
 
 def make_index_report(
@@ -739,14 +780,15 @@ def append_name_mapping(
     original_name: str,
     corrected_name: str,
     biogroup: str,
+    source: str = "",
     score="",
 ):
-    """Save a minimal correction to the name_mapping sheet."""
+    """Save a correction to the name_mapping sheet."""
     row_values = {
         "שם מקורי מ-BioGIS": original_name,
         "שם מתוקן באינדקס": corrected_name,
         "קבוצה": biogroup,
-        "מקור תיקון": "",
+        "מקור תיקון": source,
         "ציון התאמה": score,
         "אושר על ידי": "",
         "תאריך אישור": "",
@@ -784,7 +826,7 @@ def append_new_species_to_index(biogroup: str, species_values: dict):
     elif biogroup == "vertebrates":
         append_row_by_headers(ANIMALS_SHEET, species_values)
     else:
-        raise ValueError("אפשר להוסיף כרגע רק צמח או חולייתן לאינדקס.")
+        raise ValueError("New species can currently be added only to Plants or Vertebrates.")
 
 
 def get_first_occurrence_for_name(enriched_df: pd.DataFrame, name: str, biogroup: str) -> pd.Series:
@@ -798,209 +840,299 @@ def get_first_occurrence_for_name(enriched_df: pd.DataFrame, name: str, biogroup
     return subset.iloc[0]
 
 
-def render_name_pair(original_name: str, suggested_name: str, score) -> None:
-    """Render a compact before/after correction block."""
-    col1, col2 = st.columns(2)
+def to_float(value, default=0.0) -> float:
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
 
-    with col1:
-        st.markdown("**שם מתוך occurrence**")
-        st.text_input(
-            "שם מתוך occurrence",
-            value=original_name,
-            label_visibility="collapsed",
-            disabled=True,
+
+def prepare_batch_editor_df(
+    review_df: pd.DataFrame,
+    enriched_df: pd.DataFrame,
+    biogroup: str,
+    default_save_threshold: float,
+) -> pd.DataFrame:
+    """Create a compact editable table for batch corrections."""
+    subset = review_df[review_df["Group code"] == biogroup].copy()
+
+    if subset.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, record in subset.iterrows():
+        original_name = record.get("BioGIS name", "")
+        first_row = get_first_occurrence_for_name(enriched_df, original_name, biogroup)
+        score = to_float(record.get("Score", 0))
+        suggested = str(record.get("Suggested index name", "") or "")
+
+        base = {
+            "Save": score >= default_save_threshold,
+            "Action": ACTION_SAVE_INDEX,
+            "BioGIS name": original_name,
+            "Suggested index name": suggested,
+            "Correction from index": suggested,
+            "Score": score,
+            "Records": int(record.get("Records", 0) or 0),
+            "New Hebrew name": original_name,
+            "Scientific name": str(first_row.get("species", "") or ""),
+        }
+
+        if biogroup == "plants":
+            base.update(
+                {
+                    "Family": str(first_row.get("family", "") or ""),
+                    "Distribution type": "",
+                    "Frequency": "",
+                    "Classification": "",
+                }
+            )
+        else:
+            base.update(
+                {
+                    "Class": str(first_row.get("clazz", "") or ""),
+                    "Regional status / classification": "",
+                    "Global status": "",
+                }
+            )
+
+        rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+def save_batch_corrections(
+    edited_df: pd.DataFrame,
+    biogroup: str,
+    source_file_name: str,
+) -> tuple[int, list[str]]:
+    """Save all checked rows from a batch correction editor."""
+    saved_count = 0
+    errors = []
+
+    if edited_df.empty:
+        return saved_count, errors
+
+    selected_rows = edited_df[edited_df["Save"] == True].copy()  # noqa: E712
+
+    for row_index, row in selected_rows.iterrows():
+        original_name = normalize_hebrew_name(row.get("BioGIS name", ""))
+        action = row.get("Action", ACTION_SAVE_INDEX)
+        score = row.get("Score", "")
+
+        if not original_name:
+            errors.append(f"Row {row_index + 1}: missing BioGIS name.")
+            continue
+
+        try:
+            if action == ACTION_SAVE_INDEX:
+                corrected_name = normalize_hebrew_name(row.get("Correction from index", ""))
+                if not corrected_name:
+                    errors.append(f"{original_name}: choose a correction from the index.")
+                    continue
+
+                append_name_mapping(
+                    original_name=original_name,
+                    corrected_name=corrected_name,
+                    biogroup=biogroup,
+                    source="batch_index_selection",
+                    score=score,
+                )
+                saved_count += 1
+
+            elif action == ACTION_ADD_NEW:
+                new_hebrew = normalize_hebrew_name(row.get("New Hebrew name", "")) or original_name
+                scientific_name = str(row.get("Scientific name", "") or "")
+
+                if biogroup == "plants":
+                    species_values = {
+                        "שם המין": new_hebrew,
+                        "שם מדעי": scientific_name,
+                        "משפחה": str(row.get("Family", "") or ""),
+                        "טיפוס התפוצה": str(row.get("Distribution type", "") or ""),
+                        "שכיחות": str(row.get("Frequency", "") or ""),
+                        "סיווג": str(row.get("Classification", "") or ""),
+                    }
+                else:
+                    species_values = {
+                        "שם המין": new_hebrew,
+                        "שם מדעי": scientific_name,
+                        "מחלקה": str(row.get("Class", "") or ""),
+                        "סטטוס שימור אזורי": str(row.get("Regional status / classification", "") or ""),
+                        "סטטוס שימור עולמי": str(row.get("Global status", "") or ""),
+                    }
+
+                append_new_species_to_index(biogroup, species_values)
+                append_name_mapping(
+                    original_name=original_name,
+                    corrected_name=new_hebrew,
+                    biogroup=biogroup,
+                    source="batch_new_species",
+                    score=100,
+                )
+                saved_count += 1
+
+            elif action == ACTION_MARK_UNRESOLVED:
+                append_unmatched_log(
+                    original_name=original_name,
+                    biogroup=biogroup,
+                    suggestions=str(row.get("Suggested index name", "") or ""),
+                    score=score,
+                    source_file_name=source_file_name,
+                )
+                saved_count += 1
+
+            elif action == ACTION_SKIP:
+                continue
+
+        except Exception as exc:
+            errors.append(f"{original_name}: {exc}")
+
+    return saved_count, errors
+
+
+def render_batch_editor(
+    title: str,
+    biogroup: str,
+    review_df: pd.DataFrame,
+    enriched_df: pd.DataFrame,
+    index_df: pd.DataFrame,
+    source_file_name: str,
+    default_save_threshold: float,
+):
+    """Render one group-specific batch correction table."""
+    editor_df = prepare_batch_editor_df(
+        review_df=review_df,
+        enriched_df=enriched_df,
+        biogroup=biogroup,
+        default_save_threshold=default_save_threshold,
+    )
+
+    st.markdown(f"### {title}")
+
+    if editor_df.empty:
+        st.success(f"No {title.lower()} names need manual review.")
+        return
+
+    index_names = sorted(index_df["שם המין"].dropna().astype(str).unique())
+    for value in editor_df["Suggested index name"].dropna().astype(str).unique():
+        if value and value not in index_names:
+            index_names.append(value)
+    index_names = [""] + sorted(set(index_names))
+
+    common_disabled = ["BioGIS name", "Suggested index name", "Score", "Records"]
+    if biogroup == "plants":
+        column_config = {
+            "Save": st.column_config.CheckboxColumn("Save", help="Rows checked here will be saved when you press the save button."),
+            "Action": st.column_config.SelectboxColumn("Action", options=BATCH_ACTIONS),
+            "Correction from index": st.column_config.SelectboxColumn("Correction from index", options=index_names),
+            "Classification": st.column_config.TextColumn("Classification", help="Used only when adding a new plant to the index."),
+        }
+        disabled = common_disabled
+    else:
+        column_config = {
+            "Save": st.column_config.CheckboxColumn("Save", help="Rows checked here will be saved when you press the save button."),
+            "Action": st.column_config.SelectboxColumn("Action", options=BATCH_ACTIONS),
+            "Correction from index": st.column_config.SelectboxColumn("Correction from index", options=index_names),
+            "Regional status / classification": st.column_config.TextColumn(
+                "Regional status / classification",
+                help="Used only when adding a new vertebrate to the index.",
+            ),
+        }
+        disabled = common_disabled
+
+    edited_df = st.data_editor(
+        editor_df,
+        key=f"batch_editor_{biogroup}",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=disabled,
+        column_config=column_config,
+    )
+
+    checked_count = int((edited_df["Save"] == True).sum())  # noqa: E712
+    st.caption(
+        f"Rows checked for saving: {checked_count}. "
+        "For existing species, keep 'Save selected index name'. "
+        "For species missing from the index, choose 'Add as new species to index' and fill the new-species fields."
+    )
+
+    if st.button(f"Save checked {title.lower()} corrections", type="primary", key=f"save_{biogroup}"):
+        saved_count, errors = save_batch_corrections(
+            edited_df=edited_df,
+            biogroup=biogroup,
+            source_file_name=source_file_name,
         )
 
-    with col2:
-        st.markdown("**שם מוצע מהאינדקס**")
-        st.text_input(
-            "שם מוצע מהאינדקס",
-            value=suggested_name or "",
-            label_visibility="collapsed",
-            disabled=True,
-        )
+        if errors:
+            st.error("Some rows were not saved:")
+            for error in errors:
+                st.write(f"- {error}")
 
-    st.caption(f"ציון התאמה: {score}")
+        if saved_count > 0 and not errors:
+            clear_cache_and_rerun(f"Saved {saved_count} corrections.")
+        elif saved_count > 0:
+            st.success(f"Saved {saved_count} corrections. Fix the remaining rows and save again.")
+            st.cache_data.clear()
 
 
-def render_correction_panel(
+def render_batch_correction_panel(
     review_df: pd.DataFrame,
     enriched_df: pd.DataFrame,
     plants_df: pd.DataFrame,
     animals_df: pd.DataFrame,
     source_file_name: str,
 ):
-    """Render the UI that lets users approve corrections and update Google Sheets."""
-    st.subheader("4. תיקון שמות")
+    """Render all manual correction controls as batch-editable tables."""
+    st.subheader("Batch name correction")
 
     if review_df.empty:
-        st.success("אין כרגע שמות שדורשים תיקון ידני מול אינדקס הצומח או החולייתנים.")
+        st.success("No plant or vertebrate names need manual review.")
         return
 
-    st.info(
-        "בחר שם לבדיקה, אשר את ההצעה, בחר שם אחר מהאינדקס, או הוסף מין חדש. "
-        "תיקון שנשמר ייכנס ל-name_mapping וישמש אוטומטית בפעמים הבאות."
+    st.write(
+        "Review all suggested corrections in a table. The proposed correction is editable as a dropdown. "
+        "If a species is missing from the index, choose 'Add as new species to index' and fill the manual fields in the same row."
     )
 
-    review_records = review_df.to_dict("records")
-    option_labels = []
-    label_to_record = {}
-
-    for record in review_records:
-        label = f"{record['קבוצה']} | {record['שם מ-BioGIS']} | הצעה: {record['הצעה קרובה']}"
-        option_labels.append(label)
-        label_to_record[label] = record
-
-    selected_label = st.selectbox("בחר שם לבדיקה", option_labels)
-    selected = label_to_record[selected_label]
-
-    original_name = selected["שם מ-BioGIS"]
-    biogroup = selected["קוד קבוצה"]
-    suggested_name = selected["הצעה קרובה"]
-    score = selected["ציון התאמה"]
-
-    first_row = get_first_occurrence_for_name(enriched_df, original_name, biogroup)
-
-    render_name_pair(original_name, suggested_name, score)
-
-    action = st.radio(
-        "מה לעשות?",
-        [
-            "אשר את ההצעה",
-            "בחר שם אחר מהאינדקס",
-            "הוסף מין חדש לאינדקס",
-            "סמן כלא נמצא כרגע",
-        ],
-        horizontal=True,
+    default_save_threshold = st.slider(
+        "Pre-check rows with score at least",
+        min_value=0,
+        max_value=100,
+        value=90,
+        step=1,
+        help="Rows with a score at or above this value will be checked automatically. You can uncheck any row before saving.",
     )
 
-    if action == "אשר את ההצעה":
-        disabled = not bool(suggested_name)
-        if st.button("שמור תיקון", disabled=disabled, type="primary"):
-            append_name_mapping(
-                original_name=original_name,
-                corrected_name=suggested_name,
-                biogroup=biogroup,
-                score=score,
-            )
-            clear_cache_and_rerun("התיקון נשמר ב-name_mapping.")
+    tab1, tab2, tab3 = st.tabs(["Plants", "Vertebrates", "All names needing review"])
 
-    elif action == "בחר שם אחר מהאינדקס":
-        index_df = plants_df if biogroup == "plants" else animals_df
-        index_names = sorted(index_df["שם המין"].dropna().astype(str).unique())
-
-        default_index = 0
-        if suggested_name in index_names:
-            default_index = index_names.index(suggested_name)
-
-        selected_index_name = st.selectbox(
-            "בחר את השם התקין מתוך האינדקס",
-            index_names,
-            index=default_index,
+    with tab1:
+        render_batch_editor(
+            title="Plants",
+            biogroup="plants",
+            review_df=review_df,
+            enriched_df=enriched_df,
+            index_df=plants_df,
+            source_file_name=source_file_name,
+            default_save_threshold=default_save_threshold,
         )
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**שם מתוך occurrence**")
-            st.text_input(
-                "שם מתוך occurrence - בחירה ידנית",
-                value=original_name,
-                label_visibility="collapsed",
-                disabled=True,
-            )
-        with col2:
-            st.markdown("**שם שיישמר**")
-            st.text_input(
-                "שם שיישמר - בחירה ידנית",
-                value=selected_index_name,
-                label_visibility="collapsed",
-                disabled=True,
-            )
+    with tab2:
+        render_batch_editor(
+            title="Vertebrates",
+            biogroup="vertebrates",
+            review_df=review_df,
+            enriched_df=enriched_df,
+            index_df=animals_df,
+            source_file_name=source_file_name,
+            default_save_threshold=default_save_threshold,
+        )
 
-        if st.button("שמור תיקון", type="primary"):
-            append_name_mapping(
-                original_name=original_name,
-                corrected_name=selected_index_name,
-                biogroup=biogroup,
-                score=score,
-            )
-            clear_cache_and_rerun("התיקון נשמר ב-name_mapping.")
-
-    elif action == "הוסף מין חדש לאינדקס":
-        occurrence_scientific = str(first_row.get("species", "") or "")
-        occurrence_family = str(first_row.get("family", "") or "")
-        occurrence_class = str(first_row.get("clazz", "") or "")
-
-        if biogroup == "plants":
-            with st.form("add_new_plant_form"):
-                new_hebrew = st.text_input("שם המין", value=original_name)
-                new_scientific = st.text_input("שם מדעי", value=occurrence_scientific)
-                new_family = st.text_input("משפחה", value=occurrence_family)
-                new_distribution = st.text_input("טיפוס התפוצה", value="")
-                new_frequency = st.text_input("שכיחות", value="")
-                new_classification = st.text_input("סיווג", value="")
-                submitted = st.form_submit_button("הוסף לאינדקס ושמור תיקון")
-
-                if submitted:
-                    if not normalize_hebrew_name(new_hebrew):
-                        st.error("חובה למלא שם מין בעברית.")
-                    else:
-                        species_values = {
-                            "שם המין": new_hebrew,
-                            "שם מדעי": new_scientific,
-                            "משפחה": new_family,
-                            "טיפוס התפוצה": new_distribution,
-                            "שכיחות": new_frequency,
-                            "סיווג": new_classification,
-                        }
-                        append_new_species_to_index("plants", species_values)
-                        append_name_mapping(
-                            original_name=original_name,
-                            corrected_name=new_hebrew,
-                            biogroup=biogroup,
-                            score=100,
-                        )
-                        clear_cache_and_rerun("המין נוסף לאינדקס הצומח והתיקון נשמר.")
-
-        elif biogroup == "vertebrates":
-            with st.form("add_new_vertebrate_form"):
-                new_hebrew = st.text_input("שם המין", value=original_name)
-                new_scientific = st.text_input("שם מדעי", value=occurrence_scientific)
-                new_class = st.text_input("מחלקה", value=occurrence_class)
-                new_regional_status = st.text_input("סטטוס שימור אזורי", value="")
-                new_global_status = st.text_input("סטטוס שימור עולמי", value="")
-                submitted = st.form_submit_button("הוסף לאינדקס ושמור תיקון")
-
-                if submitted:
-                    if not normalize_hebrew_name(new_hebrew):
-                        st.error("חובה למלא שם מין בעברית.")
-                    else:
-                        species_values = {
-                            "שם המין": new_hebrew,
-                            "שם מדעי": new_scientific,
-                            "מחלקה": new_class,
-                            "סטטוס שימור אזורי": new_regional_status,
-                            "סטטוס שימור עולמי": new_global_status,
-                        }
-                        append_new_species_to_index("vertebrates", species_values)
-                        append_name_mapping(
-                            original_name=original_name,
-                            corrected_name=new_hebrew,
-                            biogroup=biogroup,
-                            score=100,
-                        )
-                        clear_cache_and_rerun("המין נוסף לאינדקס החולייתנים והתיקון נשמר.")
-
-    elif action == "סמן כלא נמצא כרגע":
-        if st.button("שמור כלא נמצא", type="primary"):
-            append_unmatched_log(
-                original_name=original_name,
-                biogroup=biogroup,
-                suggestions=suggested_name,
-                score=score,
-                source_file_name=source_file_name,
-            )
-            clear_cache_and_rerun("השם נשמר ב-unmatched_log.")
+    with tab3:
+        st.dataframe(review_df, use_container_width=True)
 
 
 # -----------------------------------------------------------------------------
@@ -1010,32 +1142,33 @@ def render_correction_panel(
 
 def main():
     st.set_page_config(page_title="BioGIS Converter", layout="wide")
+    apply_page_style()
 
     st.title("BioGIS Converter")
-    st.caption("סיווג קבוצות, תיקון שמות, עדכון מילון השמות, והכנת פלטים לדוח ול-GIS")
+    st.caption("Species-name correction, index updates, and outputs for reports and GIS")
 
-    st.subheader("1. בדיקת חיבור לאינדקסים")
+    st.subheader("Index connection")
 
     try:
         plants_df = load_sheet_as_dataframe(PLANTS_SHEET)
         animals_df = load_sheet_as_dataframe(ANIMALS_SHEET)
         mapping_df = load_name_mapping()
-        st.success("החיבור ל-Google Sheets הצליח")
+        st.success("Connected to Google Sheets")
     except Exception as exc:
-        st.error("החיבור ל-Google Sheets נכשל")
+        st.error("Google Sheets connection failed")
         st.exception(exc)
         st.stop()
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("מינים באינדקס צומח", len(plants_df))
+        st.metric("Plant index species", len(plants_df))
     with col2:
-        st.metric("מינים באינדקס חולייתנים", len(animals_df))
+        st.metric("Vertebrate index species", len(animals_df))
     with col3:
-        st.metric("תיקוני שמות פעילים", count_active_mappings(mapping_df))
+        st.metric("Active name corrections", count_active_mappings(mapping_df))
 
-    with st.expander("הצג דוגמאות מהאינדקסים ומהמילון"):
-        tab1, tab2, tab3 = st.tabs(["צומח", "חולייתנים", "name_mapping"])
+    with st.expander("Show index and mapping samples"):
+        tab1, tab2, tab3 = st.tabs(["Plants", "Vertebrates", "Name mapping"])
         with tab1:
             st.dataframe(plants_df.head(10), use_container_width=True)
         with tab2:
@@ -1043,24 +1176,24 @@ def main():
         with tab3:
             st.dataframe(mapping_df.tail(20), use_container_width=True)
 
-    st.subheader("2. העלאת קובץ occurrence מ-BioGIS")
+    st.subheader("Upload BioGIS occurrence CSV")
 
-    uploaded_file = st.file_uploader("העלה קובץ CSV", type=["csv"])
+    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
     if uploaded_file is None:
-        st.info("כאן יופיע ניתוח ראשוני אחרי העלאת קובץ occurrence.")
+        st.info("Upload an occurrence CSV to start processing.")
         return
 
     occurrence_df = read_occurrence_csv(uploaded_file)
-    st.success("קובץ occurrence נטען בהצלחה")
+    st.success("Occurrence file loaded")
 
     required_columns = ["species_heb", "kingdom", "clazz", "phylum", "group"]
     missing_columns = [column for column in required_columns if column not in occurrence_df.columns]
     if missing_columns:
-        st.error("חסרות עמודות נדרשות בקובץ occurrence:")
+        st.error("The occurrence file is missing required columns:")
         st.code(", ".join(missing_columns))
         st.stop()
 
-    with st.expander("עמודות בקובץ occurrence"):
+    with st.expander("Occurrence columns"):
         st.code(", ".join(occurrence_df.columns.astype(str)))
 
     enriched_df = enrich_occurrence(
@@ -1081,29 +1214,29 @@ def main():
     fungi_report_df = make_non_indexed_report(enriched_df, "fungi")
     unknown_report_df = make_non_indexed_report(enriched_df, "unknown")
 
-    st.subheader("3. סיכום קובץ occurrence")
+    st.subheader("Occurrence summary")
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("רשומות occurrence", len(enriched_df))
-    col2.metric("מינים ייחודיים", enriched_df["species_heb_normalized"].nunique())
+    col1.metric("Occurrence records", len(enriched_df))
+    col2.metric("Unique species", enriched_df["species_heb_normalized"].nunique())
     col3.metric(
-        "דורשים בדיקה ידנית",
+        "Need manual review",
         enriched_df[enriched_df["match_status"] == "needs_review"]["species_heb_normalized"].nunique(),
     )
     col4.metric(
-        "קבוצות מחוץ לאינדקס",
+        "Outside indexed groups",
         enriched_df[enriched_df["match_status"] == "not_indexed_group"]["species_heb_normalized"].nunique(),
     )
 
     col1, col2 = st.columns(2)
     with col1:
-        st.write("סיכום לפי קבוצה")
+        st.write("By biological group")
         st.dataframe(group_summary_df, use_container_width=True)
     with col2:
-        st.write("סיכום לפי סטטוס התאמה")
+        st.write("By matching status")
         st.dataframe(match_summary_df, use_container_width=True)
 
-    render_correction_panel(
+    render_batch_correction_panel(
         review_df=review_df,
         enriched_df=enriched_df,
         plants_df=plants_df,
@@ -1111,30 +1244,30 @@ def main():
         source_file_name=uploaded_file.name,
     )
 
-    st.subheader("5. תצוגה מקדימה של פלטים לדוח")
+    st.subheader("Output preview")
 
-    tabs = st.tabs(["צומח", "חולייתנים", "חסרי חוליות", "פטריות", "לא ידוע", "occurrence ל-GIS"])
+    tabs = st.tabs(["Plants", "Vertebrates", "Invertebrates", "Fungi", "Unknown", "GIS occurrence"])
 
     with tabs[0]:
-        st.write("טבלת צומח לדוח - רק התאמות מדויקות או תיקונים שנשמרו במילון")
+        st.write("Plant report table. Only exact matches and saved corrections are included.")
         st.dataframe(plants_report_df, use_container_width=True)
     with tabs[1]:
-        st.write("טבלת חולייתנים לדוח - רק התאמות מדויקות או תיקונים שנשמרו במילון")
+        st.write("Vertebrate report table. Only exact matches and saved corrections are included.")
         st.dataframe(vertebrates_report_df, use_container_width=True)
     with tabs[2]:
-        st.write("חסרי חוליות - פלט נפרד, ללא התאמה לאינדקס החולייתנים")
+        st.write("Invertebrates are exported separately and are not matched against the vertebrate index.")
         st.dataframe(invertebrates_report_df, use_container_width=True)
     with tabs[3]:
-        st.write("פטריות - פלט נפרד, ללא התאמה לאינדקס הצומח")
+        st.write("Fungi are exported separately and are not matched against the plant index.")
         st.dataframe(fungi_report_df, use_container_width=True)
     with tabs[4]:
-        st.write("רשומות שלא סווגו")
+        st.write("Records that could not be classified.")
         st.dataframe(unknown_report_df, use_container_width=True)
     with tabs[5]:
-        st.write("קובץ occurrence ל-GIS - העמודות המקוריות בתוספת species_heb_corrected ו-classification")
+        st.write("Original occurrence columns + species_heb_corrected + classification")
         st.dataframe(gis_occurrence_df.head(200), use_container_width=True)
 
-    st.subheader("6. הורדת פלטים")
+    st.subheader("Downloads")
 
     excel_bytes = to_excel_bytes(
         {
@@ -1151,21 +1284,21 @@ def main():
     col1, col2, col3 = st.columns(3)
     with col1:
         st.download_button(
-            label="הורד occurrence מועשר ל-GIS כ-CSV",
+            label="Download GIS occurrence CSV",
             data=to_csv_bytes(gis_occurrence_df),
             file_name="occurrences_enriched.csv",
             mime="text/csv",
         )
     with col2:
         st.download_button(
-            label="הורד קובץ Excel עם כל הפלטים",
+            label="Download all outputs as Excel",
             data=excel_bytes,
             file_name="biogis_outputs.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with col3:
         st.download_button(
-            label="הורד רשימת שמות לבדיקה כ-CSV",
+            label="Download review list CSV",
             data=to_csv_bytes(review_df),
             file_name="review_needed.csv",
             mime="text/csv",
