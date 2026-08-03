@@ -86,6 +86,20 @@ BATCH_ACTIONS = [
     ACTION_SKIP,
 ]
 
+BIOGIS_COLUMN_MAP = {
+    "מספר רשומה": "recordId",
+    "שם מדעי": "species",
+    "שם מדעי (עברית)": "species_heb",
+    "סוג": "genus",
+    "משפחה": "family",
+    "סדרה": "orderr",
+    "מחלקה": "clazz",
+    "מערכה": "phylum",
+    "ממלכה": "kingdom",
+    "קבוצה": "group",
+    "קו אורך": "longitude",
+    "קו רוחב": "latitude",
+}
 
 # -----------------------------------------------------------------------------
 # Page style
@@ -259,19 +273,46 @@ def find_best_match(name: str, choices: list[str]):
 # -----------------------------------------------------------------------------
 
 
+def normalize_occurrence_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize old and new BioGIS column names to the internal names
+    already used by the application.
+    """
+    normalized_df = df.copy()
+
+    normalized_df.columns = [
+        str(column).replace("\ufeff", "").strip()
+        for column in normalized_df.columns
+    ]
+
+    rename_map = {
+        new_name: internal_name
+        for new_name, internal_name in BIOGIS_COLUMN_MAP.items()
+        if new_name in normalized_df.columns
+        and internal_name not in normalized_df.columns
+    }
+
+    return normalized_df.rename(columns=rename_map)
+
+
 def read_occurrence_csv(uploaded_file) -> pd.DataFrame:
-    """Read BioGIS occurrence CSV with several possible encodings."""
+    """
+    Read a BioGIS occurrence CSV using several possible encodings,
+    then normalize old and new BioGIS column names.
+    """
     encodings = ["utf-8-sig", "utf-8", "cp1255", "iso-8859-8"]
 
     for encoding in encodings:
         try:
             uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, encoding=encoding)
+            df = pd.read_csv(uploaded_file, encoding=encoding)
+            return normalize_occurrence_columns(df)
         except UnicodeDecodeError:
             continue
 
     uploaded_file.seek(0)
-    return pd.read_csv(uploaded_file)
+    df = pd.read_csv(uploaded_file)
+    return normalize_occurrence_columns(df)
 
 
 def classify_taxon(row: pd.Series) -> str:
