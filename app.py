@@ -88,6 +88,8 @@ BATCH_ACTIONS = [
 
 BIOGIS_COLUMN_MAP = {
     "מספר רשומה": "recordId",
+    "מקור": "data_source",
+    "תאריך איסוף": "collection_date",
     "שם מדעי": "species",
     "שם מדעי (עברית)": "species_heb",
     "סוג": "genus",
@@ -97,6 +99,12 @@ BIOGIS_COLUMN_MAP = {
     "מערכה": "phylum",
     "ממלכה": "kingdom",
     "קבוצה": "group",
+    "מזהה מין": "speciesId",
+    "מין מוגן": "sprotected",
+    "מין בסיכון": "sendangered",
+    "מין פולש": "sinvasive",
+    "מין אנדמי": "sendemic",
+    "סטטוס שימור": "conservationstatus",
     "קו אורך": "longitude",
     "קו רוחב": "latitude",
 }
@@ -421,6 +429,155 @@ def build_mapping_lookup(mapping_df: pd.DataFrame) -> dict[tuple[str, str], str]
 
     return lookup
 
+def normalize_mapping_group(value) -> str:
+    """Convert mapping-sheet group values to the application's group codes."""
+    group = normalize_general(value)
+
+    if group in ["plant", "plants", "צומח", "צמחים"]:
+        return "plants"
+
+    if group in [
+        "animal",
+        "animals",
+        "vertebrate",
+        "vertebrates",
+        "בעלי חיים",
+        "חולייתנים",
+    ]:
+        return "vertebrates"
+
+    if group in [
+        "invertebrate",
+        "invertebrates",
+        "חסרי חוליות",
+    ]:
+        return "invertebrates"
+
+    if group in ["fungi", "fungus", "פטריות", "פטרייה"]:
+        return "fungi"
+
+    return ""
+
+
+def build_mapping_group_lookup(mapping_df: pd.DataFrame) -> dict[str, str]:
+    """
+    Build BioGIS normalized Hebrew name -> biological group lookup
+    from previously approved manual mappings.
+    """
+    lookup = {}
+
+    if mapping_df.empty or "שם מקורי מ-BioGIS" not in mapping_df.columns:
+        return lookup
+
+    for _, row in mapping_df.iterrows():
+        original_name = normalize_hebrew_name(
+            row.get("שם מקורי מ-BioGIS", "")
+        )
+        group_code = normalize_mapping_group(
+            row.get("קבוצה", "")
+        )
+        active_text = normalize_general(
+            row.get("פעיל", True)
+        )
+
+        if active_text in ["false", "0", "לא", "no"]:
+            continue
+
+        if original_name and group_code:
+            lookup[original_name] = group_code
+
+    return lookup
+
+
+def build_mapping_target_lookup(mapping_df: pd.DataFrame) -> dict[str, str]:
+    """
+    Build normalized original BioGIS name -> normalized corrected name lookup.
+
+    This lets the app infer the biological group from an already-approved
+    correction even when the mapping sheet does not contain a usable group.
+    """
+    lookup = {}
+
+    if mapping_df.empty:
+        return lookup
+
+    required_columns = ["שם מקורי מ-BioGIS", "שם מתוקן באינדקס"]
+    if not all(column in mapping_df.columns for column in required_columns):
+        return lookup
+
+    for _, row in mapping_df.iterrows():
+        original_name = normalize_hebrew_name(
+            row.get("שם מקורי מ-BioGIS", "")
+        )
+        corrected_name = normalize_hebrew_name(
+            row.get("שם מתוקן באינדקס", "")
+        )
+        active_text = normalize_general(
+            row.get("פעיל", True)
+        )
+
+        if active_text in ["false", "0", "לא", "no"]:
+            continue
+
+        if original_name and corrected_name:
+            lookup[original_name] = corrected_name
+
+    return lookup
+
+
+def infer_biogroup(
+    row: pd.Series,
+    normalized_name: str,
+    plant_lookup: dict[str, str],
+    animal_lookup: dict[str, str],
+    mapping_group_lookup: dict[str, str],
+    mapping_target_lookup: dict[str, str],
+) -> str:
+    """
+    Determine biological group without requiring BioGIS taxonomy fields.
+
+    Priority:
+    1. Previously approved manual mapping.
+    2. Exact match in the plant or vertebrate index.
+    3. BioGIS taxonomy, when available.
+    4. Unknown when no reliable classification is available.
+
+    Index membership is checked before BioGIS taxonomy so a partial export
+    containing only "Animalia" does not incorrectly turn a known vertebrate
+    into an invertebrate.
+    """
+    if not normalized_name:
+        return "unknown"
+
+    mapped_group = mapping_group_lookup.get(normalized_name, "")
+    if mapped_group:
+        return mapped_group
+
+    mapped_target = mapping_target_lookup.get(normalized_name, "")
+    if mapped_target:
+        target_in_plants = mapped_target in plant_lookup
+        target_in_animals = mapped_target in animal_lookup
+
+        if target_in_plants and not target_in_animals:
+            return "plants"
+        if target_in_animals and not target_in_plants:
+            return "vertebrates"
+
+    in_plants = normalized_name in plant_lookup
+    in_animals = normalized_name in animal_lookup
+
+    if in_plants and not in_animals:
+        return "plants"
+
+    if in_animals and not in_plants:
+        return "vertebrates"
+
+    taxonomy_group = classify_taxon(row)
+    if taxonomy_group != "unknown":
+        return taxonomy_group
+
+    return "unknown"
+
 
 def count_active_mappings(mapping_df: pd.DataFrame) -> int:
     """Count real active mapping rows, excluding empty template rows."""
@@ -602,13 +759,30 @@ def enrich_occurrence(
 ) -> pd.DataFrame:
     """Add group, corrected Hebrew name, match status and GIS classification."""
     enriched_df = occurrence_df.copy()
-    enriched_df["species_heb_normalized"] = enriched_df["species_heb"].apply(normalize_hebrew_name)
-    enriched_df["biogroup"] = enriched_df.apply(classify_taxon, axis=1)
-    enriched_df["group_label"] = enriched_df["biogroup"].apply(group_label)
+
+    enriched_df["species_heb_normalized"] = enriched_df["species_heb"].apply(
+        normalize_hebrew_name
+    )
 
     plant_lookup = build_index_lookup(plants_df)
     animal_lookup = build_index_lookup(animals_df)
     mapping_lookup = build_mapping_lookup(mapping_df)
+    mapping_group_lookup = build_mapping_group_lookup(mapping_df)
+    mapping_target_lookup = build_mapping_target_lookup(mapping_df)
+
+    enriched_df["biogroup"] = enriched_df.apply(
+        lambda row: infer_biogroup(
+            row=row,
+            normalized_name=row["species_heb_normalized"],
+            plant_lookup=plant_lookup,
+            animal_lookup=animal_lookup,
+            mapping_group_lookup=mapping_group_lookup,
+            mapping_target_lookup=mapping_target_lookup,
+        ),
+        axis=1,
+    )
+
+    enriched_df["group_label"] = enriched_df["biogroup"].apply(group_label)
 
     resolved_rows = []
     for _, row in enriched_df.iterrows():
@@ -632,7 +806,11 @@ def enrich_occurrence(
     plant_details = build_index_detail_lookup(plants_df)
     animal_details = build_index_detail_lookup(animals_df)
     enriched_df["classification"] = enriched_df.apply(
-        lambda row: classification_from_index_or_occurrence(row, plant_details, animal_details),
+        lambda row: classification_from_index_or_occurrence(
+            row,
+            plant_details,
+            animal_details,
+        ),
         axis=1,
     )
 
@@ -1227,12 +1405,35 @@ def main():
     occurrence_df = read_occurrence_csv(uploaded_file)
     st.success("Occurrence file loaded")
 
-    required_columns = ["species_heb", "kingdom", "clazz", "phylum", "group"]
-    missing_columns = [column for column in required_columns if column not in occurrence_df.columns]
+    required_columns = ["species_heb"]
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in occurrence_df.columns
+    ]
+
     if missing_columns:
-        st.error("The occurrence file is missing required columns:")
-        st.code(", ".join(missing_columns))
+        st.error("The occurrence file is missing the Hebrew species-name field.")
+        st.write(
+            "Make sure the BioGIS export includes 'שם מדעי (עברית)'. "
+            "Columns detected in the uploaded file:"
+        )
+        st.code(", ".join(occurrence_df.columns.astype(str)))
         st.stop()
+
+    taxonomy_columns = ["kingdom", "phylum", "clazz", "group"]
+    missing_taxonomy_columns = [
+        column
+        for column in taxonomy_columns
+        if column not in occurrence_df.columns
+    ]
+
+    if missing_taxonomy_columns:
+        st.info(
+            "Some BioGIS taxonomy fields were not included in this export. "
+            "The app will infer Plants and Vertebrates from the indexes when possible. "
+            "Species that cannot be classified reliably will be placed in Unknown."
+        )
 
     with st.expander("Occurrence columns"):
         st.code(", ".join(occurrence_df.columns.astype(str)))
@@ -1243,15 +1444,31 @@ def main():
         animals_df=animals_df,
         mapping_df=mapping_df,
     )
-    gis_occurrence_df = make_gis_occurrence_export(enriched_df, list(occurrence_df.columns))
+    gis_occurrence_df = make_gis_occurrence_export(
+        enriched_df,
+        list(occurrence_df.columns),
+    )
 
     group_summary_df = make_group_summary(enriched_df)
     match_summary_df = make_match_summary(enriched_df)
     review_df = make_review_table(enriched_df)
 
-    plants_report_df = make_index_report(enriched_df, plants_df, "plants", PLANT_REPORT_COLUMNS)
-    vertebrates_report_df = make_index_report(enriched_df, animals_df, "vertebrates", VERTEBRATE_REPORT_COLUMNS)
-    invertebrates_report_df = make_non_indexed_report(enriched_df, "invertebrates")
+    plants_report_df = make_index_report(
+        enriched_df,
+        plants_df,
+        "plants",
+        PLANT_REPORT_COLUMNS,
+    )
+    vertebrates_report_df = make_index_report(
+        enriched_df,
+        animals_df,
+        "vertebrates",
+        VERTEBRATE_REPORT_COLUMNS,
+    )
+    invertebrates_report_df = make_non_indexed_report(
+        enriched_df,
+        "invertebrates",
+    )
     fungi_report_df = make_non_indexed_report(enriched_df, "fungi")
     unknown_report_df = make_non_indexed_report(enriched_df, "unknown")
 
@@ -1259,14 +1476,21 @@ def main():
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Occurrence records", len(enriched_df))
-    col2.metric("Unique species", enriched_df["species_heb_normalized"].nunique())
+    col2.metric(
+        "Unique species",
+        enriched_df["species_heb_normalized"].nunique(),
+    )
     col3.metric(
         "Need manual review",
-        enriched_df[enriched_df["match_status"] == "needs_review"]["species_heb_normalized"].nunique(),
+        enriched_df[
+            enriched_df["match_status"] == "needs_review"
+        ]["species_heb_normalized"].nunique(),
     )
     col4.metric(
-        "Outside indexed groups",
-        enriched_df[enriched_df["match_status"] == "not_indexed_group"]["species_heb_normalized"].nunique(),
+        "Unknown / unclassified",
+        enriched_df[
+            enriched_df["biogroup"] == "unknown"
+        ]["species_heb_normalized"].nunique(),
     )
 
     col1, col2 = st.columns(2)
@@ -1287,25 +1511,53 @@ def main():
 
     st.subheader("Output preview")
 
-    tabs = st.tabs(["Plants", "Vertebrates", "Invertebrates", "Fungi", "Unknown", "GIS occurrence"])
+    tabs = st.tabs(
+        [
+            "Plants",
+            "Vertebrates",
+            "Invertebrates",
+            "Fungi",
+            "Unknown",
+            "GIS occurrence",
+        ]
+    )
 
     with tabs[0]:
-        st.write("Plant report table. Only exact matches and saved corrections are included.")
+        st.write(
+            "Plant report table. Only exact matches and saved corrections are included."
+        )
         st.dataframe(plants_report_df, use_container_width=True)
+
     with tabs[1]:
-        st.write("Vertebrate report table. Only exact matches and saved corrections are included.")
+        st.write(
+            "Vertebrate report table. Only exact matches and saved corrections are included."
+        )
         st.dataframe(vertebrates_report_df, use_container_width=True)
+
     with tabs[2]:
-        st.write("Invertebrates are exported separately and are not matched against the vertebrate index.")
+        st.write(
+            "Invertebrates are exported separately and are not matched "
+            "against the vertebrate index."
+        )
         st.dataframe(invertebrates_report_df, use_container_width=True)
+
     with tabs[3]:
-        st.write("Fungi are exported separately and are not matched against the plant index.")
+        st.write(
+            "Fungi are exported separately and are not matched against the plant index."
+        )
         st.dataframe(fungi_report_df, use_container_width=True)
+
     with tabs[4]:
-        st.write("Records that could not be classified.")
+        st.write(
+            "Species that could not be classified reliably from BioGIS taxonomy, "
+            "approved mappings, or the two indexes."
+        )
         st.dataframe(unknown_report_df, use_container_width=True)
+
     with tabs[5]:
-        st.write("Original occurrence columns + species_heb_corrected + classification")
+        st.write(
+            "Original occurrence columns + species_heb_corrected + classification"
+        )
         st.dataframe(gis_occurrence_df.head(200), use_container_width=True)
 
     st.subheader("Downloads")
@@ -1323,6 +1575,7 @@ def main():
     )
 
     col1, col2, col3 = st.columns(3)
+
     with col1:
         st.download_button(
             label="Download GIS occurrence CSV",
@@ -1330,6 +1583,7 @@ def main():
             file_name="occurrences_enriched.csv",
             mime="text/csv",
         )
+
     with col2:
         st.download_button(
             label="Download all outputs as Excel",
@@ -1337,6 +1591,7 @@ def main():
             file_name="biogis_outputs.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
     with col3:
         st.download_button(
             label="Download review list CSV",
