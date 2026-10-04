@@ -47,6 +47,7 @@ PLANT_REPORT_COLUMNS = [
     "טיפוס התפוצה",
     "שכיחות",
     "סיווג",
+    "אנדמיות",
 ]
 
 VERTEBRATE_REPORT_COLUMNS = [
@@ -743,11 +744,21 @@ def classification_from_index_or_occurrence(
     return ""
 
 
+def endemism_from_index(row: pd.Series, plant_details: dict[str, dict]) -> str:
+    """Return endemism from the resolved species in the plant index."""
+    if row.get("biogroup", "") != "plants":
+        return ""
+
+    corrected_name = normalize_hebrew_name(row.get("species_heb_corrected", ""))
+    return first_non_empty(plant_details.get(corrected_name, {}), ["אנדמיות"])
+
+
 def make_gis_occurrence_export(enriched_df: pd.DataFrame, original_columns: list[str]) -> pd.DataFrame:
-    """Create a clean occurrence table for GIS: original columns + corrected name + classification."""
+    """Create a GIS table with original columns, corrected name, classification and endemism."""
     export_df = enriched_df[original_columns].copy()
     export_df["species_heb_corrected"] = enriched_df["species_heb_corrected"]
     export_df["classification"] = enriched_df["classification"]
+    export_df["endemism"] = enriched_df["endemism"]
     return export_df
 
 
@@ -757,7 +768,7 @@ def enrich_occurrence(
     animals_df: pd.DataFrame,
     mapping_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Add group, corrected Hebrew name, match status and GIS classification."""
+    """Add group, corrected Hebrew name, match status, classification and endemism."""
     enriched_df = occurrence_df.copy()
 
     enriched_df["species_heb_normalized"] = enriched_df["species_heb"].apply(
@@ -811,6 +822,10 @@ def enrich_occurrence(
             plant_details,
             animal_details,
         ),
+        axis=1,
+    )
+    enriched_df["endemism"] = enriched_df.apply(
+        lambda row: endemism_from_index(row, plant_details),
         axis=1,
     )
 
@@ -1524,7 +1539,8 @@ def main():
 
     with tabs[0]:
         st.write(
-            "Plant report table. Only exact matches and saved corrections are included."
+            "Plant report table, including endemism from the index. "
+            "Only exact matches and saved corrections are included."
         )
         st.dataframe(plants_report_df, use_container_width=True)
 
@@ -1556,7 +1572,7 @@ def main():
 
     with tabs[5]:
         st.write(
-            "Original occurrence columns + species_heb_corrected + classification"
+            "Original occurrence columns + species_heb_corrected + classification + endemism"
         )
         st.dataframe(gis_occurrence_df.head(200), use_container_width=True)
 
