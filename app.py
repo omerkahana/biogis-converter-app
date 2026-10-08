@@ -48,6 +48,11 @@ PLANT_REPORT_COLUMNS = [
     "שכיחות",
     "סיווג",
     "אנדמיות",
+    "צורת חיים",
+    "הסרת הנוף בעונה הקשה",
+    'בית גידול (עפ"י צמחיית ישראל ברשת)',
+    'תפוצה פיטוגיאוגרפית (עפ"י צמחיית ישראל ברשת)',
+    'תפוצה בישראל וארצות שכנות (עפ"י צמחיית ישראל ברשת)',
 ]
 
 VERTEBRATE_REPORT_COLUMNS = [
@@ -1539,7 +1544,8 @@ def main():
 
     with tabs[0]:
         st.write(
-            "Plant report table, including endemism from the index. "
+            "Plant report table, including endemism, life form, seasonal foliage, "
+            "habitat, and distribution from the index. "
             "Only exact matches and saved corrections are included."
         )
         st.dataframe(plants_report_df, use_container_width=True)
@@ -1619,3 +1625,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
