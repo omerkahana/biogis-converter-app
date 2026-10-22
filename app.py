@@ -2,6 +2,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from difflib import SequenceMatcher
+import unicodedata
 
 import gspread
 import pandas as pd
@@ -12,6 +13,7 @@ SHEET_ID = "1b6qgqHh6g3VifXtxDCG-g3zGSpqt8mkktJEruo0qpjQ"
 
 PLANTS_SHEET = "plants_index"
 ANIMALS_SHEET = "animals_index"
+BUTTERFLIES_SHEET = "butterflies_index"
 MAPPING_SHEET = "name_mapping"
 UNMATCHED_SHEET = "unmatched_log"
 
@@ -63,6 +65,23 @@ VERTEBRATE_REPORT_COLUMNS = [
     "סטטוס שימור עולמי",
 ]
 
+BUTTERFLY_REPORT_COLUMNS = [
+    "שם המין",
+    "שם מדעי",
+    "משפחה",
+    "שם עברי קודם",
+    "סטטוס שימור אזורי",
+    "סטטוס שימור עולמי",
+    "סטטוס שימור ים-תיכוני",
+    "אומדן מספר בוגרים בישראל",
+    "מספר אתרים בישראל",
+    "שטח מחיה בישראל",
+    "שטח מוגן מתוך שטח המחיה",
+    "מחקר נדרש",
+    "ניטור וסקרים",
+    "ממשק",
+]
+
 STATUS_LABELS = {
     "mapped": "Resolved from name mapping",
     "exact_index": "Exact index match",
@@ -75,6 +94,7 @@ STATUS_LABELS = {
 GROUP_LABELS = {
     "plants": "Plants",
     "vertebrates": "Vertebrates",
+    "butterflies": "Butterflies",
     "invertebrates": "Invertebrates",
     "fungi": "Fungi",
     "unknown": "Unknown",
@@ -233,7 +253,10 @@ def normalize_hebrew_name(value) -> str:
     if pd.isna(value):
         return ""
 
-    text = str(value).strip()
+    text = "".join(
+        char for char in str(value).strip()
+        if not ("\u0591" <= char <= "\u05c7" and unicodedata.combining(char))
+    )
     replacements = {
         "־": "-",
         "–": "-",
@@ -330,7 +353,7 @@ def read_occurrence_csv(uploaded_file) -> pd.DataFrame:
 
 
 def classify_taxon(row: pd.Series) -> str:
-    """Classify each occurrence row into plants, vertebrates, invertebrates, fungi, or unknown."""
+    """Classify occurrences, keeping explicitly identified butterflies separate."""
     kingdom = normalize_general(row.get("kingdom", ""))
     phylum = normalize_general(row.get("phylum", ""))
     clazz = normalize_general(row.get("clazz", ""))
@@ -339,6 +362,9 @@ def classify_taxon(row: pd.Series) -> str:
 
     if "fungi" in combined or "פטר" in combined:
         return "fungi"
+
+    if any(term in group for term in ["butterfly", "butterflies", "פרפר"]):
+        return "butterflies"
 
     if (
         "plantae" in combined
@@ -388,6 +414,22 @@ def build_index_lookup(index_df: pd.DataFrame) -> dict[str, str]:
         if normalized and normalized not in lookup:
             lookup[normalized] = value
 
+    # Former names are aliases of the official name, never additional species.
+    # Ignore ambiguous aliases instead of silently choosing between species.
+    aliases = {}
+    for _, row in index_df.iterrows():
+        official_value = row.get("שם המין", "")
+        if pd.isna(official_value):
+            continue
+        official = str(official_value).strip()
+        alias_value = row.get("שמות חלופיים להתאמה", row.get("שם עברי קודם", ""))
+        for previous in normalize_hebrew_name(alias_value).split(";"):
+            previous = previous.strip()
+            if official and previous and not previous.startswith("ללא "):
+                aliases.setdefault(previous, set()).add(official)
+    for alias, names in aliases.items():
+        if len(names) == 1 and alias not in lookup:
+            lookup[alias] = next(iter(names))
     return lookup
 
 
@@ -429,6 +471,8 @@ def build_mapping_lookup(mapping_df: pd.DataFrame) -> dict[tuple[str, str], str]
             group_options.add("plants")
         if mapping_group in ["vertebrates", "vertebrate", "חולייתנים"]:
             group_options.add("vertebrates")
+        if mapping_group in ["butterflies", "butterfly", "פרפרים", "פרפר"]:
+            group_options.add("butterflies")
 
         for group_code in group_options:
             lookup[(original_name, group_code)] = corrected_name
@@ -441,6 +485,9 @@ def normalize_mapping_group(value) -> str:
 
     if group in ["plant", "plants", "צומח", "צמחים"]:
         return "plants"
+
+    if group in ["butterflies", "butterfly", "פרפרים", "פרפר"]:
+        return "butterflies"
 
     if group in [
         "animal",
@@ -538,13 +585,14 @@ def infer_biogroup(
     animal_lookup: dict[str, str],
     mapping_group_lookup: dict[str, str],
     mapping_target_lookup: dict[str, str],
+    butterfly_lookup: dict[str, str] | None = None,
 ) -> str:
     """
     Determine biological group without requiring BioGIS taxonomy fields.
 
     Priority:
     1. Previously approved manual mapping.
-    2. Exact match in the plant or vertebrate index.
+    2. Exact match in a species index (including former butterfly names).
     3. BioGIS taxonomy, when available.
     4. Unknown when no reliable classification is available.
 
@@ -555,28 +603,29 @@ def infer_biogroup(
     if not normalized_name:
         return "unknown"
 
+    butterfly_lookup = butterfly_lookup or {}
     mapped_group = mapping_group_lookup.get(normalized_name, "")
-    if mapped_group:
+    if mapped_group and mapped_group != "invertebrates":
         return mapped_group
 
     mapped_target = mapping_target_lookup.get(normalized_name, "")
-    if mapped_target:
-        target_in_plants = mapped_target in plant_lookup
-        target_in_animals = mapped_target in animal_lookup
+    indexes = {
+        "plants": plant_lookup,
+        "vertebrates": animal_lookup,
+        "butterflies": butterfly_lookup,
+    }
+    if mapped_group == "invertebrates":
+        # Only refine an approved invertebrate group into its new subgroup.
+        # Preserve the approved group for all other index/taxonomy conflicts.
+        for name in [mapped_target, normalized_name]:
+            if name in butterfly_lookup and name not in plant_lookup and name not in animal_lookup:
+                return "butterflies"
+        return "butterflies" if classify_taxon(row) == "butterflies" else mapped_group
 
-        if target_in_plants and not target_in_animals:
-            return "plants"
-        if target_in_animals and not target_in_plants:
-            return "vertebrates"
-
-    in_plants = normalized_name in plant_lookup
-    in_animals = normalized_name in animal_lookup
-
-    if in_plants and not in_animals:
-        return "plants"
-
-    if in_animals and not in_plants:
-        return "vertebrates"
+    for name in [mapped_target, normalized_name]:
+        groups = [code for code, lookup in indexes.items() if name and name in lookup]
+        if len(groups) == 1:
+            return groups[0]
 
     taxonomy_group = classify_taxon(row)
     if taxonomy_group != "unknown":
@@ -613,6 +662,8 @@ def get_mapping_match(normalized_name: str, biogroup: str, mapping_lookup: dict[
         candidates.append((normalized_name, "animals"))
     if biogroup == "plants":
         candidates.append((normalized_name, "plant"))
+    if biogroup == "butterflies":
+        candidates.extend((normalized_name, group) for group in ["butterfly", "פרפרים", "invertebrates"])
 
     for key in candidates:
         if key in mapping_lookup:
@@ -627,6 +678,7 @@ def resolve_name(
     plant_lookup: dict[str, str],
     animal_lookup: dict[str, str],
     mapping_lookup: dict[tuple[str, str], str],
+    butterfly_lookup: dict[str, str] | None = None,
 ):
     """Resolve one Hebrew species name according to group-specific indexes."""
     if not normalized_name:
@@ -638,7 +690,10 @@ def resolve_name(
             "matched_index": "",
         }
 
+    butterfly_lookup = butterfly_lookup or {}
     mapped_name = get_mapping_match(normalized_name, biogroup, mapping_lookup)
+    if mapped_name and biogroup == "butterflies":
+        mapped_name = butterfly_lookup.get(normalize_hebrew_name(mapped_name), mapped_name)
     if mapped_name:
         return {
             "species_heb_corrected": mapped_name,
@@ -684,6 +739,25 @@ def resolve_name(
             "suggested_name": animal_lookup.get(best_name, best_name or ""),
             "match_score": score,
             "matched_index": ANIMALS_SHEET,
+        }
+
+    if biogroup == "butterflies":
+        if normalized_name in butterfly_lookup:
+            official = butterfly_lookup[normalized_name]
+            return {
+                "species_heb_corrected": official,
+                "match_status": "exact_index",
+                "suggested_name": official,
+                "match_score": 100,
+                "matched_index": BUTTERFLIES_SHEET,
+            }
+        best_name, score = find_best_match(normalized_name, list(butterfly_lookup))
+        return {
+            "species_heb_corrected": "",
+            "match_status": "needs_review",
+            "suggested_name": butterfly_lookup.get(best_name, best_name or ""),
+            "match_score": score,
+            "matched_index": BUTTERFLIES_SHEET,
         }
 
     if biogroup in ["invertebrates", "fungi"]:
@@ -732,6 +806,7 @@ def classification_from_index_or_occurrence(
     row: pd.Series,
     plant_details: dict[str, dict],
     animal_details: dict[str, dict],
+    butterfly_details: dict[str, dict] | None = None,
 ) -> str:
     """Return the classification/status value to add to the GIS occurrence export."""
     corrected_name = normalize_hebrew_name(row.get("species_heb_corrected", ""))
@@ -743,6 +818,14 @@ def classification_from_index_or_occurrence(
     if biogroup == "vertebrates" and corrected_name in animal_details:
         return first_non_empty(
             animal_details[corrected_name],
+            ["סטטוס שימור אזורי", "סטטוס שימור עולמי"],
+        )
+
+    if biogroup == "butterflies":
+        # Mediterranean assessment has its own export field: it is not an
+        # Israeli or global assessment and must not become GIS classification.
+        return first_non_empty(
+            (butterfly_details or {}).get(corrected_name, {}),
             ["סטטוס שימור אזורי", "סטטוס שימור עולמי"],
         )
 
@@ -764,6 +847,7 @@ def make_gis_occurrence_export(enriched_df: pd.DataFrame, original_columns: list
     export_df["species_heb_corrected"] = enriched_df["species_heb_corrected"]
     export_df["classification"] = enriched_df["classification"]
     export_df["endemism"] = enriched_df["endemism"]
+    export_df["mediterranean_conservation_status"] = enriched_df["mediterranean_conservation_status"]
     return export_df
 
 
@@ -772,6 +856,7 @@ def enrich_occurrence(
     plants_df: pd.DataFrame,
     animals_df: pd.DataFrame,
     mapping_df: pd.DataFrame,
+    butterflies_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Add group, corrected Hebrew name, match status, classification and endemism."""
     enriched_df = occurrence_df.copy()
@@ -782,6 +867,9 @@ def enrich_occurrence(
 
     plant_lookup = build_index_lookup(plants_df)
     animal_lookup = build_index_lookup(animals_df)
+    if butterflies_df is None:
+        butterflies_df = pd.DataFrame(columns=BUTTERFLY_REPORT_COLUMNS)
+    butterfly_lookup = build_index_lookup(butterflies_df)
     mapping_lookup = build_mapping_lookup(mapping_df)
     mapping_group_lookup = build_mapping_group_lookup(mapping_df)
     mapping_target_lookup = build_mapping_target_lookup(mapping_df)
@@ -794,6 +882,7 @@ def enrich_occurrence(
             animal_lookup=animal_lookup,
             mapping_group_lookup=mapping_group_lookup,
             mapping_target_lookup=mapping_target_lookup,
+            butterfly_lookup=butterfly_lookup,
         ),
         axis=1,
     )
@@ -809,6 +898,7 @@ def enrich_occurrence(
                 plant_lookup=plant_lookup,
                 animal_lookup=animal_lookup,
                 mapping_lookup=mapping_lookup,
+                butterfly_lookup=butterfly_lookup,
             )
         )
 
@@ -821,16 +911,25 @@ def enrich_occurrence(
 
     plant_details = build_index_detail_lookup(plants_df)
     animal_details = build_index_detail_lookup(animals_df)
+    butterfly_details = build_index_detail_lookup(butterflies_df)
     enriched_df["classification"] = enriched_df.apply(
         lambda row: classification_from_index_or_occurrence(
             row,
             plant_details,
             animal_details,
+            butterfly_details,
         ),
         axis=1,
     )
     enriched_df["endemism"] = enriched_df.apply(
         lambda row: endemism_from_index(row, plant_details),
+        axis=1,
+    )
+    enriched_df["mediterranean_conservation_status"] = enriched_df.apply(
+        lambda row: first_non_empty(
+            butterfly_details.get(normalize_hebrew_name(row.get("species_heb_corrected", "")), {}),
+            ["סטטוס שימור ים-תיכוני"],
+        ) if row.get("biogroup") == "butterflies" else "",
         axis=1,
     )
 
@@ -916,7 +1015,7 @@ def make_index_report(
     biogroup: str,
     report_columns: list[str],
 ) -> pd.DataFrame:
-    """Create report table for plants or vertebrates from resolved names."""
+    """Create a report table for an indexed biological group."""
     filtered_df = enriched_df[
         (enriched_df["biogroup"] == biogroup)
         & (enriched_df["species_heb_corrected"] != "")
@@ -1059,13 +1158,15 @@ def append_unmatched_log(
 
 
 def append_new_species_to_index(biogroup: str, species_values: dict):
-    """Append a new species to plants_index or animals_index."""
+    """Append a new species to the selected biological group's index."""
     if biogroup == "plants":
         append_row_by_headers(PLANTS_SHEET, species_values)
     elif biogroup == "vertebrates":
         append_row_by_headers(ANIMALS_SHEET, species_values)
+    elif biogroup == "butterflies":
+        append_row_by_headers(BUTTERFLIES_SHEET, species_values)
     else:
-        raise ValueError("New species can currently be added only to Plants or Vertebrates.")
+        raise ValueError("New species can be added only to Plants, Vertebrates, or Butterflies.")
 
 
 def get_first_occurrence_for_name(enriched_df: pd.DataFrame, name: str, biogroup: str) -> pd.Series:
@@ -1126,6 +1227,15 @@ def prepare_batch_editor_df(
                     "Distribution type": "",
                     "Frequency": "",
                     "Classification": "",
+                }
+            )
+        elif biogroup == "butterflies":
+            base.update(
+                {
+                    "Family": str(first_row.get("family", "") or ""),
+                    "Regional status / classification": "",
+                    "Global status": "",
+                    "Mediterranean status": "",
                 }
             )
         else:
@@ -1193,6 +1303,16 @@ def save_batch_corrections(
                         "טיפוס התפוצה": str(row.get("Distribution type", "") or ""),
                         "שכיחות": str(row.get("Frequency", "") or ""),
                         "סיווג": str(row.get("Classification", "") or ""),
+                    }
+                elif biogroup == "butterflies":
+                    species_values = {
+                        "שם המין": new_hebrew,
+                        "שם מדעי": scientific_name,
+                        "משפחה": str(row.get("Family", "") or ""),
+                        "מחלקה": "חרקים",
+                        "סטטוס שימור אזורי": str(row.get("Regional status / classification", "") or ""),
+                        "סטטוס שימור עולמי": str(row.get("Global status", "") or ""),
+                        "סטטוס שימור ים-תיכוני": str(row.get("Mediterranean status", "") or ""),
                     }
                 else:
                     species_values = {
@@ -1277,9 +1397,14 @@ def render_batch_editor(
             "Correction from index": st.column_config.SelectboxColumn("Correction from index", options=index_names),
             "Regional status / classification": st.column_config.TextColumn(
                 "Regional status / classification",
-                help="Used only when adding a new vertebrate to the index.",
+                help="Used only when adding a new species to this index. Israeli/regional assessment only.",
             ),
         }
+        if biogroup == "butterflies":
+            column_config["Mediterranean status"] = st.column_config.TextColumn(
+                "Mediterranean status",
+                help="Mediterranean assessment, kept separate from Israeli and global statuses.",
+            )
         disabled = common_disabled
 
     edited_df = st.data_editor(
@@ -1324,12 +1449,13 @@ def render_batch_correction_panel(
     plants_df: pd.DataFrame,
     animals_df: pd.DataFrame,
     source_file_name: str,
+    butterflies_df: pd.DataFrame,
 ):
     """Render all manual correction controls as batch-editable tables."""
     st.subheader("Batch name correction")
 
     if review_df.empty:
-        st.success("No plant or vertebrate names need manual review.")
+        st.success("No plant, vertebrate, or butterfly names need manual review.")
         return
 
     st.write(
@@ -1346,7 +1472,7 @@ def render_batch_correction_panel(
         help="Rows with a score at or above this value will be checked automatically. You can uncheck any row before saving.",
     )
 
-    tab1, tab2, tab3 = st.tabs(["Plants", "Vertebrates", "All names needing review"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Plants", "Vertebrates", "Butterflies", "All names needing review"])
 
     with tab1:
         render_batch_editor(
@@ -1371,6 +1497,17 @@ def render_batch_correction_panel(
         )
 
     with tab3:
+        render_batch_editor(
+            title="Butterflies",
+            biogroup="butterflies",
+            review_df=review_df,
+            enriched_df=enriched_df,
+            index_df=butterflies_df,
+            source_file_name=source_file_name,
+            default_save_threshold=default_save_threshold,
+        )
+
+    with tab4:
         st.dataframe(review_df, use_container_width=True)
 
 
@@ -1391,6 +1528,7 @@ def main():
     try:
         plants_df = load_sheet_as_dataframe(PLANTS_SHEET)
         animals_df = load_sheet_as_dataframe(ANIMALS_SHEET)
+        butterflies_df = load_sheet_as_dataframe(BUTTERFLIES_SHEET)
         mapping_df = load_name_mapping()
         st.success("Connected to Google Sheets")
     except Exception as exc:
@@ -1398,21 +1536,25 @@ def main():
         st.exception(exc)
         st.stop()
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Plant index species", len(plants_df))
     with col2:
         st.metric("Vertebrate index species", len(animals_df))
     with col3:
+        st.metric("Butterfly index species", len(butterflies_df))
+    with col4:
         st.metric("Active name corrections", count_active_mappings(mapping_df))
 
     with st.expander("Show index and mapping samples"):
-        tab1, tab2, tab3 = st.tabs(["Plants", "Vertebrates", "Name mapping"])
+        tab1, tab2, tab3, tab4 = st.tabs(["Plants", "Vertebrates", "Butterflies", "Name mapping"])
         with tab1:
             st.dataframe(plants_df.head(10), use_container_width=True)
         with tab2:
             st.dataframe(animals_df.head(10), use_container_width=True)
         with tab3:
+            st.dataframe(butterflies_df.head(10), use_container_width=True)
+        with tab4:
             st.dataframe(mapping_df.tail(20), use_container_width=True)
 
     st.subheader("Upload BioGIS occurrence CSV")
@@ -1451,7 +1593,7 @@ def main():
     if missing_taxonomy_columns:
         st.info(
             "Some BioGIS taxonomy fields were not included in this export. "
-            "The app will infer Plants and Vertebrates from the indexes when possible. "
+            "The app will infer Plants, Vertebrates, and Butterflies from the indexes when possible. "
             "Species that cannot be classified reliably will be placed in Unknown."
         )
 
@@ -1463,6 +1605,7 @@ def main():
         plants_df=plants_df,
         animals_df=animals_df,
         mapping_df=mapping_df,
+        butterflies_df=butterflies_df,
     )
     gis_occurrence_df = make_gis_occurrence_export(
         enriched_df,
@@ -1484,6 +1627,12 @@ def main():
         animals_df,
         "vertebrates",
         VERTEBRATE_REPORT_COLUMNS,
+    )
+    butterflies_report_df = make_index_report(
+        enriched_df,
+        butterflies_df,
+        "butterflies",
+        BUTTERFLY_REPORT_COLUMNS,
     )
     invertebrates_report_df = make_non_indexed_report(
         enriched_df,
@@ -1527,6 +1676,7 @@ def main():
         plants_df=plants_df,
         animals_df=animals_df,
         source_file_name=uploaded_file.name,
+        butterflies_df=butterflies_df,
     )
 
     st.subheader("Output preview")
@@ -1535,6 +1685,7 @@ def main():
         [
             "Plants",
             "Vertebrates",
+            "Butterflies",
             "Invertebrates",
             "Fungi",
             "Unknown",
@@ -1558,27 +1709,35 @@ def main():
 
     with tabs[2]:
         st.write(
-            "Invertebrates are exported separately and are not matched "
+            "Butterfly report table. Only exact matches and saved corrections are included. "
+            "The source CSV provides Mediterranean statuses; Israeli/regional and global statuses are blank when unavailable."
+        )
+        st.dataframe(butterflies_report_df, use_container_width=True)
+
+    with tabs[3]:
+        st.write(
+            "Other invertebrates are exported separately and are not matched "
             "against the vertebrate index."
         )
         st.dataframe(invertebrates_report_df, use_container_width=True)
 
-    with tabs[3]:
+    with tabs[4]:
         st.write(
             "Fungi are exported separately and are not matched against the plant index."
         )
         st.dataframe(fungi_report_df, use_container_width=True)
 
-    with tabs[4]:
+    with tabs[5]:
         st.write(
             "Species that could not be classified reliably from BioGIS taxonomy, "
-            "approved mappings, or the two indexes."
+            "approved mappings, or the species indexes."
         )
         st.dataframe(unknown_report_df, use_container_width=True)
 
-    with tabs[5]:
+    with tabs[6]:
         st.write(
-            "Original occurrence columns + species_heb_corrected + classification + endemism"
+            "Original occurrence columns + species_heb_corrected + classification + endemism "
+            "+ mediterranean_conservation_status"
         )
         st.dataframe(gis_occurrence_df.head(200), use_container_width=True)
 
@@ -1589,6 +1748,7 @@ def main():
             "occurrences_enriched": gis_occurrence_df,
             "plants_report": plants_report_df,
             "vertebrates_report": vertebrates_report_df,
+            "butterflies_report": butterflies_report_df,
             "invertebrates_report": invertebrates_report_df,
             "fungi_report": fungi_report_df,
             "unknown_report": unknown_report_df,
@@ -1622,7 +1782,15 @@ def main():
             mime="text/csv",
         )
 
+    st.download_button(
+        label="Download butterfly report CSV",
+        data=to_csv_bytes(butterflies_report_df),
+        file_name="butterflies_report.csv",
+        mime="text/csv",
+    )
+
 
 if __name__ == "__main__":
     main()
+
 
