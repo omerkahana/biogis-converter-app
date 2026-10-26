@@ -57,6 +57,27 @@ PLANT_REPORT_COLUMNS = [
     'תפוצה בישראל וארצות שכנות (עפ"י צמחיית ישראל ברשת)',
 ]
 
+# Editor labels map to the actual plants_index headers for both display and save.
+PLANT_EDITOR_FIELDS = {
+    "Family": "משפחה",
+    "Distribution type": "טיפוס התפוצה",
+    "Frequency": "שכיחות",
+    "Classification": "סיווג",
+    "Endemism": "אנדמיות",
+    "Alien / invasive status": "זר",
+    "Protected status": "מוגן",
+    "Risk status": "סיכון",
+    "Red-list status": "מין אדום",
+    "Life form": "צורת חיים",
+    "Seasonal foliage": "הסרת הנוף בעונה הקשה",
+    "Habitat": 'בית גידול (עפ"י צמחיית ישראל ברשת)',
+    "Phytogeographic distribution": 'תפוצה פיטוגיאוגרפית (עפ"י צמחיית ישראל ברשת)',
+    "Distribution in Israel and neighboring countries": 'תפוצה בישראל וארצות שכנות (עפ"י צמחיית ישראל ברשת)',
+    "Plant code": "קוד",
+    "Source link": "קישור",
+    "Plant ID": "מספר צמח",
+}
+
 VERTEBRATE_REPORT_COLUMNS = [
     "שם המין",
     "שם מדעי",
@@ -236,9 +257,21 @@ def append_row_by_headers(sheet_name: str, row_values: dict):
     worksheet.append_row(values, value_input_option="USER_ENTERED")
 
 
-def clear_cache_and_rerun(message: str):
-    """Clear cached Google Sheet reads and rerun the app."""
-    st.cache_data.clear()
+def clear_correction_cache(biogroup: str):
+    """Refresh the affected index and mappings without discarding output caches."""
+    index_sheet = {
+        "plants": PLANTS_SHEET,
+        "vertebrates": ANIMALS_SHEET,
+        "butterflies": BUTTERFLIES_SHEET,
+    }.get(biogroup)
+    load_sheet_as_dataframe.clear(MAPPING_SHEET)
+    if index_sheet:
+        load_sheet_as_dataframe.clear(index_sheet)
+
+
+def clear_cache_and_rerun(message: str, biogroup: str):
+    """Refresh saved corrections and rerun the app."""
+    clear_correction_cache(biogroup)
     st.success(message)
     st.rerun()
 
@@ -333,10 +366,17 @@ def normalize_occurrence_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def read_occurrence_csv(uploaded_file) -> pd.DataFrame:
+    """Read an upload by content so cache hits do not depend on its cursor."""
+    return read_occurrence_bytes(uploaded_file.getvalue())
+
+
+@st.cache_data(ttl=300, max_entries=4, show_spinner=False)
+def read_occurrence_bytes(csv_content: bytes) -> pd.DataFrame:
     """
     Read a BioGIS occurrence CSV using several possible encodings,
     then normalize old and new BioGIS column names.
     """
+    uploaded_file = BytesIO(csv_content)
     encodings = ["utf-8-sig", "utf-8", "cp1255", "iso-8859-8"]
 
     for encoding in encodings:
@@ -851,6 +891,16 @@ def make_gis_occurrence_export(enriched_df: pd.DataFrame, original_columns: list
     return export_df
 
 
+def dataframe_cache_key(frame: pd.DataFrame):
+    """Hash every row, including changes outside Streamlit's large-table sample."""
+    return (
+        tuple(frame.columns),
+        tuple(str(dtype) for dtype in frame.dtypes),
+        pd.util.hash_pandas_object(frame, index=True).values.tobytes(),
+    )
+
+
+@st.cache_data(ttl=300, max_entries=4, show_spinner=False, hash_funcs={pd.DataFrame: dataframe_cache_key})
 def enrich_occurrence(
     occurrence_df: pd.DataFrame,
     plants_df: pd.DataFrame,
@@ -889,10 +939,14 @@ def enrich_occurrence(
 
     enriched_df["group_label"] = enriched_df["biogroup"].apply(group_label)
 
+    # A species may occur thousands of times. Fuzzy matching depends only on
+    # its normalized name and inferred group, not on each observation.
+    resolutions = {}
     resolved_rows = []
     for _, row in enriched_df.iterrows():
-        resolved_rows.append(
-            resolve_name(
+        key = (row["species_heb_normalized"], row["biogroup"])
+        if key not in resolutions:
+            resolutions[key] = resolve_name(
                 normalized_name=row["species_heb_normalized"],
                 biogroup=row["biogroup"],
                 plant_lookup=plant_lookup,
@@ -900,7 +954,7 @@ def enrich_occurrence(
                 mapping_lookup=mapping_lookup,
                 butterfly_lookup=butterfly_lookup,
             )
-        )
+        resolved_rows.append(resolutions[key])
 
     resolved_df = pd.DataFrame(resolved_rows)
     enriched_df = pd.concat(
@@ -1091,11 +1145,13 @@ def make_non_indexed_report(enriched_df: pd.DataFrame, biogroup: str) -> pd.Data
     return grouped[columns].sort_values(by="שם המין")
 
 
+@st.cache_data(ttl=300, max_entries=8, show_spinner=False, hash_funcs={pd.DataFrame: dataframe_cache_key})
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Convert DataFrame to UTF-8-SIG CSV bytes for Hebrew-friendly Excel opening."""
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
+@st.cache_data(ttl=300, max_entries=2, show_spinner=False, hash_funcs={pd.DataFrame: dataframe_cache_key})
 def to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
     """Create a multi-sheet Excel file in memory."""
     output = BytesIO()
@@ -1217,18 +1273,12 @@ def prepare_batch_editor_df(
             "Score": score,
             "Records": int(record.get("Records", 0) or 0),
             "New Hebrew name": original_name,
-            "Scientific name": str(first_row.get("species", "") or ""),
+            "Scientific name": first_non_empty(first_row, ["species"]),
         }
 
         if biogroup == "plants":
-            base.update(
-                {
-                    "Family": str(first_row.get("family", "") or ""),
-                    "Distribution type": "",
-                    "Frequency": "",
-                    "Classification": "",
-                }
-            )
+            base.update({field: "" for field in PLANT_EDITOR_FIELDS})
+            base["Family"] = first_non_empty(first_row, ["family"])
         elif biogroup == "butterflies":
             base.update(
                 {
@@ -1293,16 +1343,16 @@ def save_batch_corrections(
 
             elif action == ACTION_ADD_NEW:
                 new_hebrew = normalize_hebrew_name(row.get("New Hebrew name", "")) or original_name
-                scientific_name = str(row.get("Scientific name", "") or "")
+                scientific_name = first_non_empty(row, ["Scientific name"])
 
                 if biogroup == "plants":
                     species_values = {
                         "שם המין": new_hebrew,
                         "שם מדעי": scientific_name,
-                        "משפחה": str(row.get("Family", "") or ""),
-                        "טיפוס התפוצה": str(row.get("Distribution type", "") or ""),
-                        "שכיחות": str(row.get("Frequency", "") or ""),
-                        "סיווג": str(row.get("Classification", "") or ""),
+                        **{
+                            header: first_non_empty(row, [field])
+                            for field, header in PLANT_EDITOR_FIELDS.items()
+                        },
                     }
                 elif biogroup == "butterflies":
                     species_values = {
@@ -1387,8 +1437,16 @@ def render_batch_editor(
             "Save": st.column_config.CheckboxColumn("Save", help="Rows checked here will be saved when you press the save button."),
             "Action": st.column_config.SelectboxColumn("Action", options=BATCH_ACTIONS),
             "Correction from index": st.column_config.SelectboxColumn("Correction from index", options=index_names),
-            "Classification": st.column_config.TextColumn("Classification", help="Used only when adding a new plant to the index."),
         }
+        for field, header in PLANT_EDITOR_FIELDS.items():
+            column_config[field] = st.column_config.TextColumn(
+                field,
+                help=f"New plants only. Saved to the index column: {header}.",
+            )
+        column_config["Classification"] = st.column_config.TextColumn(
+            "Classification",
+            help="New plants only. For an invasive plant enter פולש. This classification is also exported to GIS.",
+        )
         disabled = common_disabled
     else:
         column_config = {
@@ -1407,24 +1465,37 @@ def render_batch_editor(
             )
         disabled = common_disabled
 
-    edited_df = st.data_editor(
-        editor_df,
-        key=f"batch_editor_{biogroup}",
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        disabled=disabled,
-        column_config=column_config,
-    )
-
-    checked_count = int((edited_df["Save"] == True).sum())  # noqa: E712
     st.caption(
-        f"Rows checked for saving: {checked_count}. "
+        "Check Save on the rows you want to save. "
         "For existing species, keep 'Save selected index name'. "
-        "For species missing from the index, choose 'Add as new species to index' and fill the new-species fields."
+        "For species missing from the index, choose 'Add as new species to index' and fill the new-species fields. "
+        "Edits are sent together only when you press the save button. "
+        "Save your edits before changing the pre-check threshold or uploading another file."
     )
+    if biogroup == "plants":
+        st.caption(
+            "Scroll right for habitat, life form, endemism, and the other index fields. "
+            "For an invasive plant, enter פולש in Classification and add its origin/status in Alien / invasive status. "
+            "When adding a new species, Correction from index is ignored."
+        )
 
-    if st.button(f"Save checked {title.lower()} corrections", type="primary", key=f"save_{biogroup}"):
+    # Keep cell edits in the browser until Save. Without a form, every edit
+    # reruns occurrence processing and rebuilds the downloads.
+    with st.form(key=f"batch_form_{biogroup}"):
+        edited_df = st.data_editor(
+            editor_df,
+            key=f"batch_editor_{biogroup}",
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=disabled,
+            column_config=column_config,
+        )
+        submitted = st.form_submit_button(
+            f"Save checked {title.lower()} corrections", type="primary"
+        )
+
+    if submitted:
         saved_count, errors = save_batch_corrections(
             edited_df=edited_df,
             biogroup=biogroup,
@@ -1437,10 +1508,10 @@ def render_batch_editor(
                 st.write(f"- {error}")
 
         if saved_count > 0 and not errors:
-            clear_cache_and_rerun(f"Saved {saved_count} corrections.")
+            clear_cache_and_rerun(f"Saved {saved_count} corrections.", biogroup)
         elif saved_count > 0:
             st.success(f"Saved {saved_count} corrections. Fix the remaining rows and save again.")
-            st.cache_data.clear()
+            clear_correction_cache(biogroup)
 
 
 def render_batch_correction_panel(
@@ -1792,5 +1863,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
